@@ -1,0 +1,269 @@
+---
+title: "Predicting Credit Default with Tidymodels"
+author: "Qin (Vanessa) Zhang"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output: github_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4.5, dpi = 150,
+  fig.path = "figures/"
+)
+```
+
+## 1. Goal
+
+Can we predict, at the time of application, whether a loan applicant will
+**default** ("bad" status) using information they provide (income, assets,
+debt, job, loan amount, etc.)? This mirrors common risk questions in
+insurance and financial services, such as predicting claims or lapses.
+
+I compare an interpretable baseline (**logistic regression**) against a
+flexible machine-learning model (**random forest**) and evaluate both on a
+held-out test set.
+
+## 2. Setup
+
+```{r packages}
+library(tidymodels)   # rsample, recipes, parsnip, workflows, tune, yardstick
+library(modeldata)    # contains the credit_data dataset
+library(ranger)       # random forest engine
+
+
+tidymodels_prefer()   # resolve function-name conflicts in favor of tidymodels
+set.seed(2026)        # make every random step reproducible
+```
+
+## 3. Data
+
+```{r data}
+data(credit_data, package = "modeldata")
+credit <- as_tibble(credit_data)
+
+glimpse(credit)
+```
+
+### Outcome balance
+
+```{r outcome}
+credit |>
+  count(Status) |>
+  mutate(prop = n / sum(n))
+```
+
+About 28% of applicants defaulted, so the classes are imbalanced. That is
+why I use **stratified** splitting and evaluate with **ROC AUC** rather than
+accuracy alone.
+
+### Missing data
+
+```{r missing}
+credit |>
+  summarise(across(everything(), ~ sum(is.na(.x)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") |>
+  filter(n_missing > 0) |>
+  arrange(desc(n_missing))
+```
+
+Missingness is modest. Imputation is done **inside the modeling recipe**, so
+imputation values are learned from the training data only (avoiding data
+leakage into the test set).
+
+### Exploratory plots
+
+```{r eda-income, fig.height = 4}
+credit |>
+  ggplot(aes(x = Status, y = Income, fill = Status)) +
+  geom_boxplot(alpha = 0.7, show.legend = FALSE) +
+  labs(title = "Income by repayment status", x = NULL, y = "Income") +
+  theme_minimal()
+```
+
+```{r eda-records, fig.height = 4}
+credit |>
+  ggplot(aes(x = Records, fill = Status)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Default rate by prior credit records",
+       x = "Has prior negative records", y = "Share of applicants") +
+  theme_minimal()
+```
+
+## 4. Train / test split and cross-validation
+
+```{r split}
+credit_split <- initial_split(credit, prop = 0.75, strata = Status)
+credit_train <- training(credit_split)
+credit_test  <- testing(credit_split)
+
+# 5-fold cross-validation on the training set only
+credit_folds <- vfold_cv(credit_train, v = 5, strata = Status)
+
+c(train = nrow(credit_train), test = nrow(credit_test))
+```
+
+The test set is set aside and used **once**, at the very end.
+
+## 5. Preprocessing recipe
+
+```{r recipe}
+credit_rec <- recipe(Status ~ ., data = credit_train) |>
+  step_impute_median(all_numeric_predictors()) |>   # fill numeric NAs
+  step_impute_mode(all_nominal_predictors()) |>     # fill categorical NAs
+  step_dummy(all_nominal_predictors()) |>           # categories -> 0/1 columns
+  step_zv(all_predictors()) |>                      # drop zero-variance columns
+  step_normalize(all_numeric_predictors())          # center and scale
+
+credit_rec
+```
+
+## 6. Models
+
+```{r models}
+# Model 1: logistic regression (interpretable baseline)
+log_spec <- logistic_reg() |>
+  set_engine("glm") |>
+  set_mode("classification")
+
+# Model 2: random forest with hyperparameters to tune
+rf_spec <- rand_forest(mtry = tune(), min_n = tune(), trees = 500) |>
+  set_engine("ranger", importance = "impurity") |>
+  set_mode("classification")
+
+log_wf <- workflow() |> add_recipe(credit_rec) |> add_model(log_spec)
+rf_wf  <- workflow() |> add_recipe(credit_rec) |> add_model(rf_spec)
+
+credit_metrics <- metric_set(roc_auc, accuracy, sensitivity, specificity)
+```
+
+## 7. Cross-validated comparison
+
+```{r cv-logistic}
+log_res <- fit_resamples(
+  log_wf,
+  resamples = credit_folds,
+  metrics   = credit_metrics,
+  control   = control_resamples(save_pred = TRUE)
+)
+
+collect_metrics(log_res)
+```
+
+```{r cv-rf}
+rf_res <- tune_grid(
+  rf_wf,
+  resamples = credit_folds,
+  grid      = 10,
+  metrics   = credit_metrics
+)
+
+show_best(rf_res, metric = "roc_auc", n = 3)
+```
+
+```{r cv-compare}
+bind_rows(
+  collect_metrics(log_res) |> mutate(model = "Logistic regression"),
+  show_best(rf_res, metric = "roc_auc", n = 1) |>
+    select(.metric, mean, std_err) |>
+    mutate(model = "Random forest (best)")
+) |>
+  filter(.metric == "roc_auc") |>
+  select(model, .metric, mean, std_err)
+```
+
+## 8. Final model on the held-out test set
+
+```{r final-fit}
+best_rf <- select_best(rf_res, metric = "roc_auc")
+final_rf_wf <- finalize_workflow(rf_wf, best_rf)
+
+# last_fit(): train on the full training set, evaluate once on the test set
+final_rf  <- last_fit(final_rf_wf,  credit_split, metrics = credit_metrics)
+final_log <- last_fit(log_wf,       credit_split, metrics = credit_metrics)
+
+bind_rows(
+  collect_metrics(final_log) |> mutate(model = "Logistic regression"),
+  collect_metrics(final_rf)  |> mutate(model = "Random forest")
+) |>
+  select(model, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate)
+```
+
+### ROC curves (test set)
+
+```{r roc}
+bind_rows(
+  collect_predictions(final_log) |> mutate(model = "Logistic regression"),
+  collect_predictions(final_rf)  |> mutate(model = "Random forest")
+) |>
+  group_by(model) |>
+  roc_curve(truth = Status, .pred_bad) |>
+  autoplot() +
+  labs(title = "ROC curves on the held-out test set")
+```
+
+### Confusion matrix (random forest, 0.5 threshold)
+
+```{r confusion}
+collect_predictions(final_rf) |>
+  conf_mat(truth = Status, estimate = .pred_class)
+```
+
+### Choosing a decision threshold
+
+At the default 0.5 cutoff, the model misses many applicants who default
+(low sensitivity). In practice, the cutoff is a business decision: missing a
+defaulter usually costs more than declining a good applicant. Below I compare
+several cutoffs using the logistic regression's test-set predictions.
+
+```{r thresholds}
+class_metrics <- metric_set(sensitivity, specificity, accuracy)
+log_preds <- collect_predictions(final_log)
+
+map_dfr(c(0.5, 0.4, 0.3, 0.2), function(cutoff) {
+  log_preds |>
+    mutate(pred = factor(if_else(.pred_bad >= cutoff, "bad", "good"),
+                         levels = levels(Status))) |>
+    class_metrics(truth = Status, estimate = pred) |>
+    mutate(cutoff = cutoff)
+}) |>
+  select(cutoff, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate)
+```
+
+### Which predictors matter most?
+
+```{r importance}
+final_rf |>
+  extract_fit_engine() |>
+  ranger::importance() |>
+  tibble::enframe(name = "variable", value = "importance") |>
+  slice_max(importance, n = 10) |>
+  ggplot(aes(x = importance, y = reorder(variable, importance))) +
+  geom_col() +
+  labs(title = "Random forest variable importance (top 10)",
+       x = "Importance", y = NULL) +
+  theme_minimal()
+```
+
+### Logistic regression coefficients (odds ratios)
+
+```{r coefficients}
+final_log |>
+  extract_fit_parsnip() |>
+  tidy(exponentiate = TRUE) |>
+  filter(term != "(Intercept)") |>
+  arrange(p.value) |>
+  slice_head(n = 10)
+```
+
+Note: `glm` models the probability of the *second* factor level ("good"),
+so odds ratios above 1 indicate higher odds of **repaying**.
+
+## 9. Session info
+
+```{r session}
+sessionInfo()
+```
